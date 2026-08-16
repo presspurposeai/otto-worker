@@ -83,16 +83,16 @@ app.post('/run', auth, async (req, res) => {
       'Launching browser session',
       'running'
     );
-
+    
     browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
-    });
+  headless: true,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu'
+  ]
+});
 
     const context = await browser.newContext({
       viewport: {
