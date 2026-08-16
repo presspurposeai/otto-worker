@@ -75,7 +75,13 @@ app.post('/run', auth, async (req, res) => {
     await step(0, 'Launching browser session', 'running');
 
     browser = await chromium.launch({
-      headless: true
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process'
+      ]
     });
 
     const context = await browser.newContext({
