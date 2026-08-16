@@ -1,24 +1,26 @@
-// server.js — Otto browser worker (complete file, live view included)
-// Deploy target: Fly.io app "otto-worker"
-// Env vars required: OTTO_WORKER_SECRET, OTTO_PUBLIC_URL
-// Optional: OTTO_LIVE_FRAME_MS (default 700), PORT (default 8080)
+// server.js — Otto browser worker v3
+// Adds: live view streaming, saved website logins (persistent sessions),
+//       and multi-step scripted actions (click / type / press / wait / scroll).
+//
+// Required Fly secrets: OTTO_WORKER_SECRET, OTTO_PUBLIC_URL
+// Deploy: replace this file wholesale in the otto-worker repo, then `fly deploy`.
 
 const express = require("express");
 const crypto = require("crypto");
 const { chromium } = require("playwright");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 
-const PORT = process.env.PORT || 8080;
 const SECRET = process.env.OTTO_WORKER_SECRET || "";
-const PUBLIC_URL = (process.env.OTTO_PUBLIC_URL || "https://otto-worker.fly.dev").replace(/\/$/, "");
-const FRAME_MS = Number(process.env.OTTO_LIVE_FRAME_MS || 700);
+const PUBLIC_URL = (
+  process.env.OTTO_PUBLIC_URL || "https://otto-worker.fly.dev"
+).replace(/\/$/, "");
+const PORT = process.env.PORT || 8080;
 
-// ---------------------------------------------------------------- live view
-
-/** taskId -> { buf: Buffer, ts: number } */
-const frames = new Map();
+// ------------------------------------------------------------------ live view
+// Latest JPEG frame per task, held in memory only for the life of the task.
+const frames = new Map(); // taskId -> Buffer
 
 function viewToken(taskId) {
   return crypto
@@ -32,65 +34,57 @@ function liveUrl(taskId) {
   return `${PUBLIC_URL}/live/${taskId}?k=${viewToken(taskId)}`;
 }
 
-function checkToken(taskId, k) {
-  if (!SECRET || !k) return false;
-
-  const a = Buffer.from(String(k));
-  const b = Buffer.from(viewToken(taskId));
-
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+function checkView(req, taskId) {
+  return (
+    typeof req.query.k === "string" &&
+    req.query.k === viewToken(taskId)
+  );
 }
 
-function startLiveView(page, taskId) {
-  let stopped = false;
+app.get("/live/:taskId/frame.jpg", (req, res) => {
+  const { taskId } = req.params;
 
-  (async () => {
-    while (!stopped) {
-      try {
-        if (!page.isClosed()) {
-          const buf = await page.screenshot({
-            type: "jpeg",
-            quality: 45,
-            timeout: 5000
-          });
+  if (!checkView(req, taskId)) {
+    return res.status(403).send("Forbidden");
+  }
 
-          frames.set(taskId, {
-            buf,
-            ts: Date.now()
-          });
-        }
-      } catch (_) {
-        // page busy or navigating — skip this frame
-      }
+  const buf = frames.get(taskId);
 
-      await new Promise((r) => setTimeout(r, FRAME_MS));
-    }
+  if (!buf) {
+    return res.status(404).send("No frame yet");
+  }
 
-    frames.delete(taskId);
-  })();
+  res.set("Cache-Control", "no-store");
+  res.type("jpeg").send(buf);
+});
 
-  return () => {
-    stopped = true;
-  };
-}
+app.get("/live/:taskId", (req, res) => {
+  const { taskId } = req.params;
 
-const VIEWER_HTML = (taskId, k) => `<!doctype html>
+  if (!checkView(req, taskId)) {
+    return res.status(403).send("Forbidden");
+  }
+
+  const k = viewToken(taskId);
+
+  res.type("html").send(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Otto live view</title>
+
   <style>
     html,body{
       margin:0;
       height:100%;
-      background:#0a0f1a;
-      color:#e2e8f0;
-      font:14px/1.4 Inter,system-ui,sans-serif
+      background:#0b1220;
+      overflow:hidden
     }
 
-    .wrap{
-      height:100%;
+    #wrap{
+      position:absolute;
+      inset:0;
       display:flex;
       align-items:center;
       justify-content:center
@@ -102,109 +96,172 @@ const VIEWER_HTML = (taskId, k) => `<!doctype html>
       display:block
     }
 
-    .idle{
-      opacity:.7;
-      display:flex;
-      align-items:center;
-      gap:8px
+    #msg{
+      color:#94a3b8;
+      font:14px -apple-system,system-ui,sans-serif
     }
 
-    .dot{
-      width:8px;
-      height:8px;
-      border-radius:99px;
-      background:#4EEEB0;
-      animation:p 1.2s infinite
-    }
-
-    @keyframes p{
-      0%,100%{opacity:1}
-      50%{opacity:.25}
+    #cursor{
+      position:absolute;
+      width:18px;
+      height:18px;
+      margin:-9px 0 0 -9px;
+      border-radius:50%;
+      background:rgba(6,182,212,.35);
+      border:2px solid #06b6d4;
+      pointer-events:none;
+      transition:left .25s ease,top .25s ease;
+      display:none
     }
   </style>
 </head>
 
 <body>
-  <div class="wrap">
-    <div class="idle" id="idle">
-      <span class="dot"></span>
-      Waiting for the browser…
-    </div>
-
+  <div id="wrap">
+    <span id="msg">Starting the session…</span>
     <img
       id="f"
       alt="Otto live view"
       style="display:none"
     >
+    <div id="cursor"></div>
   </div>
 
   <script>
+    const img = document.getElementById('f');
+    const msg = document.getElementById('msg');
     const src = "/live/${taskId}/frame.jpg?k=${k}&t=";
 
-    const img = document.getElementById("f");
-    const idle = document.getElementById("idle");
+    let stopped = false;
 
     function tick() {
-      const n = new Image();
+      if (stopped) return;
 
-      n.onload = () => {
-        img.src = n.src;
-        img.style.display = "block";
-        idle.style.display = "none";
+      const next = new Image();
+
+      next.onload = () => {
+        img.src = next.src;
+        img.style.display = 'block';
+        msg.style.display = 'none';
+        setTimeout(tick, 350);
       };
 
-      n.src = src + Date.now();
+      next.onerror = () => {
+        setTimeout(tick, 900);
+      };
+
+      next.src = src + Date.now();
     }
 
-    setInterval(tick, ${FRAME_MS});
     tick();
+
+    window.addEventListener('pagehide', () => {
+      stopped = true;
+    });
   </script>
 </body>
-</html>`;
-
-app.get("/live/:taskId/frame.jpg", (req, res) => {
-  const { taskId } = req.params;
-
-  if (!checkToken(taskId, req.query.k)) {
-    return res.status(403).end();
-  }
-
-  const f = frames.get(taskId);
-
-  if (!f) {
-    return res.status(404).end();
-  }
-
-  res.set("Content-Type", "image/jpeg");
-  res.set("Cache-Control", "no-store");
-  res.send(f.buf);
+</html>`);
 });
 
-app.get("/live/:taskId", (req, res) => {
-  const { taskId } = req.params;
-  const k = String(req.query.k || "");
+// ------------------------------------------------------------------- health
 
-  if (!checkToken(taskId, k)) {
-    return res.status(403).send("Forbidden");
-  }
-
-  res.set("Content-Type", "text/html; charset=utf-8");
-  res.set("Cache-Control", "no-store");
-
-  // allow embedding in the portal iframe
-  res.removeHeader("X-Frame-Options");
-
-  res.send(VIEWER_HTML(taskId, k));
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "otto-worker",
+    version: 3
+  });
 });
 
-// ---------------------------------------------------------------- callbacks
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    version: 3,
+    ts: Date.now()
+  });
+});
+
+app.get("/diag", async (_req, res) => {
+  let browser;
+
+  try {
+    browser = await launch();
+
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    await page.goto("https://example.com", {
+      waitUntil: "domcontentloaded",
+      timeout: 20000
+    });
+
+    res.json({
+      ok: true,
+      version: 3,
+      chromium: browser.version(),
+      title: await page.title()
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: String(e && e.message || e)
+    });
+  } finally {
+    try {
+      await browser?.close();
+    } catch {}
+  }
+});
+
+function launch() {
+  return chromium.launch({
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-blink-features=AutomationControlled"
+    ]
+  });
+}
+
+// --------------------------------------------------------------------- run
+
+app.post("/run", (req, res) => {
+  if (
+    !SECRET ||
+    req.headers["x-otto-secret"] !== SECRET
+  ) {
+    return res.status(401).json({
+      error: "Unauthorized"
+    });
+  }
+
+  const task = req.body || {};
+
+  if (!task.task_id) {
+    return res.status(400).json({
+      error: "task_id required"
+    });
+  }
+
+  // Answer immediately with the live URL so the portal can slide the viewer in.
+  res.json({
+    ok: true,
+    accepted: true,
+    live_view_url: liveUrl(task.task_id)
+  });
+
+  runTask(task).catch((e) => {
+    console.error("task failed", e);
+  });
+});
 
 async function callback(task, payload) {
   try {
     await fetch(task.callback_url, {
       method: "POST",
       headers: {
-        "content-type": "application/json",
+        "Content-Type": "application/json",
         "x-otto-secret": SECRET,
         "x-otto-job-token": task.job_token || ""
       },
@@ -214,187 +271,189 @@ async function callback(task, payload) {
       })
     });
   } catch (e) {
-    console.error(
-      "callback failed",
-      payload.type,
-      e.message
-    );
+    console.error("callback error", e.message);
   }
 }
 
-const step = (
-  task,
-  idx,
-  label,
-  status,
-  detail
-) =>
-  callback(task, {
-    type: "step",
-    idx,
-    label,
-    status,
-    detail: detail || {}
-  });
+function firstUrl(task) {
+  const i = task.inputs || {};
 
-// ---------------------------------------------------------------- health
-
-app.get("/", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "otto-worker"
-  });
-});
-
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    ts: Date.now()
-  });
-});
-
-app.get("/diag", async (_req, res) => {
-  let browser;
-
-  try {
-    browser = await chromium.launch({
-      args: [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu"
-      ]
-    });
-
-    const page = await browser.newPage();
-
-    await page.goto("https://example.com", {
-      waitUntil: "domcontentloaded",
-      timeout: 20000
-    });
-
-    const title = await page.title();
-
-    res.json({
-      ok: true,
-      chromium: browser.version(),
-      title
-    });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: e.message
-    });
-  } finally {
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
-  }
-});
-
-// ---------------------------------------------------------------- run
-
-app.post("/run", (req, res) => {
-  if (!SECRET || req.get("x-otto-secret") !== SECRET) {
-    return res.status(401).json({
-      error: "Unauthorized"
-    });
+  if (i.url) {
+    return String(i.url);
   }
 
-  const task = req.body || {};
+  const m = String(task.goal || "").match(
+    /https?:\/\/[^\s]+|(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s]*)?/i
+  );
 
-  if (!task.task_id || !task.callback_url) {
-    return res.status(400).json({
-      error: "task_id and callback_url are required"
-    });
+  if (!m) {
+    return null;
   }
 
-  // Answer immediately with the live URL so the portal can show "Watch live".
-  res.json({
-    ok: true,
-    accepted: true,
-    live_view_url: liveUrl(task.task_id)
-  });
+  const raw = m[0];
 
-  runTask(task).catch(async (e) => {
-    await callback(task, {
-      type: "finish",
-      status: "failed",
-      error: e.message
-    });
-  });
-});
+  return raw.startsWith("http")
+    ? raw
+    : `https://${raw}`;
+}
+
+// Actions come from inputs.steps:
+// [{action, selector?, text?, ms?}]
+async function runAction(page, step) {
+  const sel = step.selector;
+
+  switch (
+    String(step.action || "").toLowerCase()
+  ) {
+    case "goto":
+      await page.goto(step.url, {
+        waitUntil: "domcontentloaded",
+        timeout: 45000
+      });
+      break;
+
+    case "click":
+      await page.click(sel, {
+        timeout: 20000
+      });
+      break;
+
+    case "type":
+    case "fill":
+      await page.fill(
+        sel,
+        String(step.text ?? ""),
+        {
+          timeout: 20000
+        }
+      );
+      break;
+
+    case "press":
+      await page.keyboard.press(
+        step.text || "Enter"
+      );
+      break;
+
+    case "scroll":
+      await page.mouse.wheel(
+        0,
+        Number(step.ms || 800)
+      );
+      break;
+
+    case "wait":
+      await page.waitForTimeout(
+        Number(step.ms || 1500)
+      );
+      break;
+
+    case "wait_for":
+      await page.waitForSelector(
+        sel,
+        {
+          timeout: Number(
+            step.ms || 20000
+          )
+        }
+      );
+      break;
+
+    default:
+      await page.waitForTimeout(500);
+  }
+}
 
 async function runTask(task) {
-  const started = Date.now();
+  const taskId = task.task_id;
 
   let browser;
-  let stopLive = () => {};
+  let context;
+  let page;
+  let streamer;
+
+  let idx = 0;
+
+  const step = (
+    label,
+    status = "succeeded",
+    detail = {}
+  ) =>
+    callback(task, {
+      type: "step",
+      idx: idx++,
+      label,
+      status,
+      detail
+    });
 
   try {
+    await callback(task, {
+      type: "live",
+      live_view_url: liveUrl(taskId)
+    });
+
     await step(
-      task,
-      1,
-      "Launching the browser",
+      "Opening a secure browser session",
       "running"
     );
 
-    browser = await chromium.launch({
-      args: [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu"
-      ]
-    });
+    browser = await launch();
 
-    const context = await browser.newContext({
+    context = await browser.newContext({
       viewport: {
         width: 1280,
         height: 800
-      }
+      },
+
+      // Saved website login for this tenant + domain,
+      // if PressPurpose sent one.
+      storageState:
+        task.storage_state &&
+        Object.keys(task.storage_state).length
+          ? task.storage_state
+          : undefined,
+
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+        "AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/125 Safari/537.36"
     });
 
-    const page = await context.newPage();
+    page = await context.newPage();
 
-    // ---- live view on ----
-    stopLive = startLiveView(
-      page,
-      task.task_id
+    // Stream frames for the live view.
+    streamer = setInterval(
+      async () => {
+        try {
+          frames.set(
+            taskId,
+            await page.screenshot({
+              type: "jpeg",
+              quality: 55
+            })
+          );
+        } catch {}
+      },
+      700
     );
 
-    await callback(task, {
-      type: "live",
-      live_view_url: liveUrl(task.task_id)
-    });
+    if (task.storage_state) {
+      await step(
+        "Restoring your saved sign-in"
+      );
+    }
+
+    const url = firstUrl(task);
+
+    if (!url) {
+      throw new Error(
+        "No website was provided for this task."
+      );
+    }
 
     await step(
-      task,
-      1,
-      "Launching the browser",
-      "succeeded"
-    );
-
-    const inputs = task.inputs || {};
-
-    const target =
-      inputs.url ||
-      (
-        typeof task.goal === "string" &&
-        (task.goal.match(/https?:\/\/\S+/) || [])[0]
-      ) ||
-      (
-        typeof task.goal === "string" &&
-        (task.goal.match(/[a-z0-9-]+\.[a-z]{2,}\S*/i) || [])[0]
-      ) ||
-      "https://example.com";
-
-    const url = target.startsWith("http")
-      ? target
-      : `https://${target}`;
-
-    await step(
-      task,
-      2,
-      `Navigating to ${url}`,
+      `Opening ${url}`,
       "running"
     );
 
@@ -403,73 +462,116 @@ async function runTask(task) {
       timeout: 45000
     });
 
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1200);
 
-    await step(
-      task,
-      2,
-      `Navigating to ${url}`,
-      "succeeded"
-    );
+    const scripted =
+      Array.isArray(task.inputs?.steps)
+        ? task.inputs.steps
+        : [];
 
-    await step(
-      task,
-      3,
-      "Capturing the result",
-      "running"
-    );
+    for (const s of scripted) {
+      await step(
+        s.label ||
+          `${s.action} ${
+            s.selector || s.text || ""
+          }`.trim(),
+        "running"
+      );
+
+      await runAction(page, s);
+
+      await page.waitForTimeout(600);
+    }
+
+    await step("Reading the page");
 
     const title = await page.title();
 
-    const headings = await page
-      .$$eval(
-        "h1, h2",
-        (els) =>
-          els
-            .slice(0, 8)
-            .map((e) => e.textContent.trim())
-            .filter(Boolean)
+    const text = (
+      await page.evaluate(
+        () =>
+          document.body?.innerText || ""
       )
-      .catch(() => []);
+    ).slice(0, 4000);
 
-    await step(
-      task,
-      3,
-      "Capturing the result",
-      "succeeded",
-      {
-        title
-      }
+    const signedIn = await page.evaluate(
+      () =>
+        !/\b(sign in|log in|login)\b/i.test(
+          document.body?.innerText?.slice(
+            0,
+            1500
+          ) || ""
+        )
     );
+
+    // Hand the refreshed cookies back so the next task stays signed in.
+    if (task.session_domain) {
+      try {
+        const state =
+          await context.storageState();
+
+        await callback(task, {
+          type: "session",
+          domain: task.session_domain,
+          storage_state: state
+        });
+
+        await step(
+          "Saved this sign-in for next time"
+        );
+      } catch {}
+    }
 
     await callback(task, {
       type: "finish",
       status: "succeeded",
+
       result: {
         url: page.url(),
         title,
-        headings
+        signed_in: signedIn,
+        actions_run: scripted.length,
+
+        summary:
+          `Opened ${page.url()} — "${title}". ` +
+          `${
+            scripted.length
+              ? `Completed ${scripted.length} action(s). `
+              : ""
+          }` +
+          `${text.slice(0, 600)}`
       },
-      browser_ms: Date.now() - started
+
+      browser_ms: 0,
+      replay_available: false
     });
   } catch (e) {
     await callback(task, {
       type: "finish",
       status: "failed",
-      error: e.message,
-      browser_ms: Date.now() - started
+      error: String(
+        e && e.message || e
+      )
     });
   } finally {
-    stopLive();
+    clearInterval(streamer);
+    frames.delete(taskId);
 
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
+    try {
+      await context?.close();
+    } catch {}
+
+    try {
+      await browser?.close();
+    } catch {}
   }
 }
 
 app.listen(
   PORT,
   "0.0.0.0",
-  () => console.log(`otto-worker listening on ${PORT}`)
+  () =>
+    console.log(
+      `otto-worker v3 listening on ${PORT}`
+    )
 );
