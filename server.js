@@ -33,7 +33,45 @@ async function sendCallback(callbackUrl, payload, jobToken) {
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
+app.get('/diag', async (req, res) => {
+  const fs = require('fs');
+  const out = {
+    args: LAUNCH_ARGS,
+    shm: null,
+    mem: null,
+    error: null
+  };
 
+  try {
+    out.shm = fs.statfsSync('/dev/shm');
+  } catch {}
+
+  try {
+    out.mem = fs
+      .readFileSync('/proc/meminfo', 'utf8')
+      .split('\n')
+      .slice(0, 3);
+  } catch {}
+
+  try {
+    const b = await chromium.launch({
+      headless: true,
+      args: LAUNCH_ARGS
+    });
+
+    const p = await b.newPage();
+
+    await p.goto('https://example.com');
+
+    out.ok = true;
+
+    await b.close();
+  } catch (e) {
+    out.error = String(e && e.stack || e);
+  }
+
+  res.json(out);
+});
 app.post('/run', auth, async (req, res) => {
   const {
     task_id,
