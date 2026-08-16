@@ -14,15 +14,16 @@ function auth(req, res, next) {
   next();
 }
 
-async function sendCallback(callbackUrl, payload) {
+async function sendCallback(callbackUrl, payload, jobToken) {
   try {
     await fetch(callbackUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Otto-Secret': WORKER_SECRET
+        'X-Otto-Secret': WORKER_SECRET,
+        'X-Otto-Job-Token': jobToken
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payload)
     });
   } catch (e) {
     console.error('Callback failed:', e.message);
@@ -39,12 +40,13 @@ app.post('/run', auth, async (req, res) => {
     skill_key,
     goal,
     inputs,
-    callback_url
+    callback_url,
+    job_token
   } = req.body;
 
-  if (!task_id || !callback_url) {
+  if (!task_id || !callback_url || !job_token) {
     return res.status(400).json({
-      error: 'Missing task_id or callback_url'
+      error: 'Missing task_id, callback_url, or job_token'
     });
   }
 
@@ -59,20 +61,28 @@ app.post('/run', auth, async (req, res) => {
     status = 'succeeded',
     detail = {}
   ) => {
-    await sendCallback(callback_url, {
-      task_id,
-      type: 'step',
-      idx,
-      label,
-      status,
-      detail
-    });
+    await sendCallback(
+      callback_url,
+      {
+        task_id,
+        type: 'step',
+        idx,
+        label,
+        status,
+        detail
+      },
+      job_token
+    );
   };
 
   let browser;
 
   try {
-    await step(0, 'Launching browser session', 'running');
+    await step(
+      0,
+      'Launching browser session',
+      'running'
+    );
 
     browser = await chromium.launch({
       headless: true,
@@ -119,25 +129,33 @@ app.post('/run', auth, async (req, res) => {
       }
     );
 
-    await sendCallback(callback_url, {
-      task_id,
-      type: 'finish',
-      status: 'succeeded',
-      result: {
-        skill_key,
-        url: page.url(),
-        title: await page.title()
+    await sendCallback(
+      callback_url,
+      {
+        task_id,
+        type: 'finish',
+        status: 'succeeded',
+        result: {
+          skill_key,
+          url: page.url(),
+          title: await page.title()
+        },
+        cost_usd: 0.05,
+        replay_available: false
       },
-      cost_usd: 0.05,
-      replay_available: false
-    });
+      job_token
+    );
   } catch (err) {
-    await sendCallback(callback_url, {
-      task_id,
-      type: 'finish',
-      status: 'failed',
-      error: err.message
-    });
+    await sendCallback(
+      callback_url,
+      {
+        task_id,
+        type: 'finish',
+        status: 'failed',
+        error: err.message
+      },
+      job_token
+    );
   } finally {
     if (browser) {
       await browser.close();
