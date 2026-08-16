@@ -88,6 +88,7 @@ app.post('/run', auth, async (req, res) => {
       headless: true,
       args: [
         '--no-sandbox',
+        '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu'
       ]
