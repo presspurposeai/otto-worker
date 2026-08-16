@@ -89,8 +89,7 @@ app.post('/run', auth, async (req, res) => {
       args: [
         '--no-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process'
+        '--disable-gpu'
       ]
     });
 
