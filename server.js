@@ -6,14 +6,6 @@ app.use(express.json({ limit: '50mb' }));
 
 const PORT = process.env.PORT || 8080;
 const WORKER_SECRET = process.env.OTTO_WORKER_SECRET;
-const express = require('express');
-const { chromium } = require('playwright');
-const app = express();
-
-app.use(express.json({ limit: '50mb' }));
-
-const PORT = process.env.PORT || 8080;
-const WORKER_SECRET = process.env.OTTO_WORKER_SECRET;
 
 const LAUNCH_ARGS = [
   '--no-sandbox',
